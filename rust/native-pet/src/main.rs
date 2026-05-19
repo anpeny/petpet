@@ -1166,6 +1166,7 @@ extern "C" {
     fn CFRelease(value: *const c_void);
 }
 
+#[cfg(target_os = "macos")]
 extern "C" {
     #[link_name = "kCFRunLoopCommonModes"]
     static K_CF_RUN_LOOP_COMMON_MODES: CFStringRef;
