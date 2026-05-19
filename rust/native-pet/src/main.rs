@@ -10,11 +10,13 @@ use std::os::raw::c_double;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition};
-use tao::event::{Event, StartCause, WindowEvent};
+use tao::event::{ElementState, Event, MouseButton, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::window::{Window, WindowBuilder};
 #[cfg(target_os = "macos")]
 use tao::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
+#[cfg(target_os = "windows")]
+use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
+use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wgpu::util::DeviceExt;
@@ -350,6 +352,28 @@ fn main() {
                 ..
             } => {
                 handle_local_cursor_move(&mut state, &window, position.x, position.y);
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        state: ElementState::Pressed,
+                        button: MouseButton::Left,
+                        ..
+                    },
+                ..
+            } => {
+                handle_local_mouse_down(&mut state, &window);
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        state: ElementState::Released,
+                        button: MouseButton::Left,
+                        ..
+                    },
+                ..
+            } => {
+                handle_local_mouse_up(&mut state, &window);
             }
             Event::WindowEvent {
                 event: WindowEvent::Moved(_),
@@ -741,6 +765,9 @@ fn create_pet_window(event_loop: &tao::event_loop::EventLoop<String>, size: u32)
     #[cfg(target_os = "macos")]
     let builder = builder.with_has_shadow(false);
 
+    #[cfg(target_os = "windows")]
+    let builder = builder.with_undecorated_shadow(false);
+
     let window = builder
         .build(event_loop)
         .expect("failed to create native pet window");
@@ -754,7 +781,11 @@ fn configure_transparent_window(window: &Window) {
     {
         window.set_has_shadow(false);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        window.set_undecorated_shadow(false);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = window;
     }
@@ -768,7 +799,7 @@ fn create_tray(state: &AppState) -> Result<TrayIcon, String> {
     TrayIconBuilder::new()
         .with_tooltip(APP_NAME)
         .with_icon(icon)
-        .with_icon_as_template(true)
+        .with_icon_as_template(cfg!(target_os = "macos"))
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(true)
         .with_menu_on_right_click(true)
@@ -1299,6 +1330,37 @@ fn handle_local_cursor_move(state: &mut AppState, window: &Window, x: f64, y: f6
     let _ = window;
     state.local_cursor_x = Some(x);
     state.local_cursor_y = Some(y);
+}
+
+fn handle_local_mouse_down(state: &mut AppState, window: &Window) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        state.pending_return = None;
+        state.drag_state = None;
+        state.set_action("drag-held");
+        let _ = window.drag_window();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = state;
+        let _ = window;
+    }
+}
+
+fn handle_local_mouse_up(state: &mut AppState, window: &Window) {
+    #[cfg(not(target_os = "macos"))]
+    {
+        if state.current_action == "drag-held" {
+            state.set_action("idle");
+        }
+        save_window_position(window, &mut state.settings);
+        save_settings(&state.settings);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = state;
+        let _ = window;
+    }
 }
 
 fn handle_global_mouse_down(state: &mut AppState, window: &Window, x: f64, y: f64) {
