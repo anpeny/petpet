@@ -2,8 +2,10 @@ use image::ImageReader;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use std::ffi::c_void;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::os::raw::c_double;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
