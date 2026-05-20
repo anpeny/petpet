@@ -798,8 +798,14 @@ fn configure_transparent_window(window: &Window) {
 
 fn create_tray(state: &AppState) -> Result<TrayIcon, String> {
     let menu = build_tray_menu(state)?;
+    #[cfg(target_os = "windows")]
+    let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32)
+        .ok()
+        .or_else(|| load_tray_icon(&state.root))
+        .ok_or_else(|| "failed to create tray icon".to_string())?;
+    #[cfg(not(target_os = "windows"))]
     let icon = load_tray_icon(&state.root)
-        .or_else(|| Icon::from_rgba(tray_icon_rgba(), 18, 18).ok())
+        .or_else(|| Icon::from_rgba(tray_icon_rgba(32), 32, 32).ok())
         .ok_or_else(|| "failed to create tray icon".to_string())?;
     TrayIconBuilder::new()
         .with_tooltip(APP_NAME)
@@ -1281,6 +1287,13 @@ fn normalize_screen_point(window: &Window, x: f64, y: f64) -> (f64, f64) {
     (x * scale, y * scale)
 }
 
+#[cfg(not(target_os = "macos"))]
+fn local_to_screen_point(window: &Window, x: f64, y: f64) -> Option<(f64, f64)> {
+    let position = window.outer_position().ok()?;
+    let scale = window.scale_factor();
+    Some((position.x as f64 + x * scale, position.y as f64 + y * scale))
+}
+
 fn point_to_rect_distance(x: f64, y: f64, rect: (f64, f64, f64, f64)) -> f64 {
     let (left, top, width, height) = rect;
     let right = left + width;
@@ -1332,18 +1345,33 @@ fn handle_wheel_activity(state: &mut AppState) {
 }
 
 fn handle_local_cursor_move(state: &mut AppState, window: &Window, x: f64, y: f64) {
-    let _ = window;
     state.local_cursor_x = Some(x);
     state.local_cursor_y = Some(y);
+    #[cfg(not(target_os = "macos"))]
+    {
+        if state.drag_state.is_some() {
+            if let Some((screen_x, screen_y)) = local_to_screen_point(window, x, y) {
+                update_drag_motion(state, window, screen_x, screen_y);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+    }
 }
 
 fn handle_local_mouse_down(state: &mut AppState, window: &Window) {
     #[cfg(not(target_os = "macos"))]
     {
         state.pending_return = None;
-        state.drag_state = None;
+        if let (Some(x), Some(y)) = (state.local_cursor_x, state.local_cursor_y) {
+            if let Some((screen_x, screen_y)) = local_to_screen_point(window, x, y) {
+                begin_drag(state, window, screen_x, screen_y, true);
+                return;
+            }
+        }
         state.set_action("drag-held");
-        let _ = window.drag_window();
     }
     #[cfg(target_os = "macos")]
     {
@@ -1355,7 +1383,9 @@ fn handle_local_mouse_down(state: &mut AppState, window: &Window) {
 fn handle_local_mouse_up(state: &mut AppState, window: &Window) {
     #[cfg(not(target_os = "macos"))]
     {
-        if state.current_action == "drag-held" {
+        if state.drag_state.is_some() {
+            finish_drag(state, window);
+        } else if state.current_action == "drag-held" {
             state.set_action("idle");
         }
         save_window_position(window, &mut state.settings);
@@ -1373,6 +1403,10 @@ fn handle_global_mouse_down(state: &mut AppState, window: &Window, x: f64, y: f6
     if !point_inside_window(window, x, y) {
         return;
     }
+    begin_drag(state, window, x, y, false);
+}
+
+fn begin_drag(state: &mut AppState, window: &Window, x: f64, y: f64, local_drag: bool) {
     let position = window.outer_position().ok();
     let Some(position) = position else {
         return;
@@ -1401,9 +1435,16 @@ fn handle_global_mouse_down(state: &mut AppState, window: &Window, x: f64, y: f6
         run_candidate_since: None,
         walk_candidate_since: None,
     });
+    if local_drag {
+        eprintln!("native-pet: local drag started");
+    }
 }
 
 fn handle_global_mouse_up(state: &mut AppState, window: &Window, _x: f64, _y: f64) {
+    finish_drag(state, window);
+}
+
+fn finish_drag(state: &mut AppState, window: &Window) {
     let Some(drag) = state.drag_state.take() else {
         return;
     };
@@ -1423,6 +1464,14 @@ fn handle_global_mouse_up(state: &mut AppState, window: &Window, _x: f64, _y: f6
 
 fn handle_global_mouse_move(state: &mut AppState, window: &Window, x: f64, y: f64) {
     let (x, y) = normalize_screen_point(window, x, y);
+    if update_drag_motion(state, window, x, y) {
+        return;
+    }
+
+    handle_mouse_reactivity(state, window, x, y);
+}
+
+fn update_drag_motion(state: &mut AppState, window: &Window, x: f64, y: f64) -> bool {
     let now = Instant::now();
     let moved = (x - state.last_mouse_x).hypot(y - state.last_mouse_y);
     if moved >= 2.0 {
@@ -1504,9 +1553,14 @@ fn handle_global_mouse_move(state: &mut AppState, window: &Window, x: f64, y: f6
             );
             state.set_movement_action(action);
         }
-        return;
+        return true;
     }
 
+    state.drag_state.is_some()
+}
+
+fn handle_mouse_reactivity(state: &mut AppState, window: &Window, x: f64, y: f64) {
+    let now = Instant::now();
     if !state.settings.mouse_watch_enabled || !can_react(state) {
         return;
     }
@@ -1968,20 +2022,45 @@ fn action_labels() -> HashMap<&'static str, String> {
     ])
 }
 
-fn tray_icon_rgba() -> Vec<u8> {
-    let mut rgba = vec![0; 18 * 18 * 4];
-    for y in 0..18 {
-        for x in 0..18 {
-            let dx = x as f32 - 9.0;
-            let dy = y as f32 - 7.0;
-            let head = dx * dx / 31.0 + dy * dy / 25.0 <= 1.0;
-            let body = y >= 10 && y <= 16 && x >= 5 && x <= 13;
-            let hair = y >= 4 && y <= 13 && (x <= 5 || x >= 13);
-            let face = (x == 7 || x == 11) && y == 7;
-            let smile = y == 10 && x >= 7 && x <= 11;
-            if head || body || hair || face || smile {
-                let offset = (y * 18 + x) * 4;
-                rgba[offset + 3] = 255;
+fn tray_icon_rgba(size: u32) -> Vec<u8> {
+    let mut rgba = vec![0; (size * size * 4) as usize];
+    let center = size as f32 / 2.0;
+    for y in 0..size {
+        for x in 0..size {
+            let xf = x as f32;
+            let yf = y as f32;
+            let dx = xf - center;
+            let dy = yf - center * 0.82;
+            let head = dx * dx / (center * 0.62).powi(2) + dy * dy / (center * 0.58).powi(2) <= 1.0;
+            let hair = head && (yf < center * 0.82 || xf < center * 0.54 || xf > center * 1.46);
+            let face = head && !hair;
+            let shirt = yf >= center * 1.1
+                && yf <= center * 1.72
+                && xf >= center * 0.58
+                && xf <= center * 1.42;
+            let eye = ((xf - center * 0.78).abs() <= 1.0 || (xf - center * 1.22).abs() <= 1.0)
+                && (yf - center * 0.76).abs() <= 1.0;
+            let smile = yf >= center * 0.98
+                && yf <= center * 1.04
+                && xf >= center * 0.82
+                && xf <= center * 1.18;
+            let outline = dx * dx / (center * 0.67).powi(2) + dy * dy / (center * 0.63).powi(2) <= 1.0
+                && !head;
+
+            let color = if eye || smile {
+                Some([25, 25, 25, 255])
+            } else if hair || outline {
+                Some([18, 18, 18, 255])
+            } else if face {
+                Some([255, 236, 220, 255])
+            } else if shirt {
+                Some([255, 126, 170, 255])
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                let offset = ((y * size + x) * 4) as usize;
+                rgba[offset..offset + 4].copy_from_slice(&color);
             }
         }
     }

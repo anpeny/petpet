@@ -39,9 +39,9 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.3</string>
+  <string>0.1.4</string>
   <key>CFBundleVersion</key>
-  <string>4</string>
+  <string>5</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSAppleEventsUsageDescription</key>
