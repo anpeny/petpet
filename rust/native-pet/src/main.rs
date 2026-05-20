@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{ElementState, Event, MouseButton, StartCause, WindowEvent};
+use tao::event_loop::EventLoopProxy;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 #[cfg(target_os = "macos")]
 use tao::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
@@ -22,6 +23,25 @@ use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wgpu::util::DeviceExt;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::{
+    Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    System::LibraryLoader::GetModuleHandleW,
+    UI::{
+        Shell::{
+            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+        },
+        WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+            DestroyWindow, GetCursorPos, GetWindowLongPtrW, LoadIconW, PostMessageW,
+            RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, CREATESTRUCTW,
+            CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDI_APPLICATION, MF_ENABLED, MF_GRAYED, MF_POPUP,
+            MF_SEPARATOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
+            WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_RBUTTONUP,
+            WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+        },
+    },
+};
 
 const APP_NAME: &str = "Q JK 桌宠";
 const FRAME_FPS: u64 = 16;
@@ -209,7 +229,12 @@ impl AppState {
         }
     }
 
-    fn set_action_once(&mut self, id: impl Into<String>, return_to: impl Into<String>, duration: Duration) {
+    fn set_action_once(
+        &mut self,
+        id: impl Into<String>,
+        return_to: impl Into<String>,
+        duration: Duration,
+    ) {
         self.set_action(id);
         self.pending_return = Some((return_to.into(), Instant::now() + duration));
     }
@@ -249,7 +274,9 @@ impl AppState {
     }
 
     fn tick(&mut self) {
-        let delay = Duration::from_millis((1000.0 / FRAME_FPS as f64 / self.settings.speed).max(1.0) as u64);
+        let delay = Duration::from_millis(
+            (1000.0 / FRAME_FPS as f64 / self.settings.speed).max(1.0) as u64,
+        );
         if self.last_frame_at.elapsed() < delay {
             self.tick_transitions();
             return;
@@ -314,16 +341,24 @@ struct FrameImage {
     pixels: Vec<u8>,
 }
 
+#[cfg(target_os = "windows")]
+type AppTray = WindowsTray;
+
+#[cfg(not(target_os = "windows"))]
+type AppTray = TrayIcon;
+
 fn main() {
     let root = resource_root();
     let event_loop = EventLoopBuilder::<String>::with_user_event().build();
+    let tray_proxy = event_loop.create_proxy();
     let mut state = AppState::new(root);
     state.settings = load_settings();
 
     let window = create_pet_window(&event_loop, state.settings.size);
     apply_saved_position(&window, &state.settings);
-    let mut renderer = pollster::block_on(Renderer::new(&window)).expect("failed to create renderer");
-    let mut tray: Option<TrayIcon> = None;
+    let mut renderer =
+        pollster::block_on(Renderer::new(&window)).expect("failed to create renderer");
+    let mut tray: Option<AppTray> = None;
     let mut last_tray_check = Instant::now() - Duration::from_secs(10);
 
     MenuEvent::set_event_handler(Some({
@@ -338,13 +373,13 @@ fn main() {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         match event {
             Event::NewEvents(StartCause::Init) => {
-                ensure_tray_visible(&mut tray, &state);
+                ensure_tray_visible(&mut tray, &state, &tray_proxy);
             }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 state.tick();
                 if last_tray_check.elapsed() >= Duration::from_secs(5) {
                     last_tray_check = Instant::now();
-                    ensure_tray_visible(&mut tray, &state);
+                    ensure_tray_visible(&mut tray, &state, &tray_proxy);
                 }
                 window.request_redraw();
             }
@@ -354,7 +389,7 @@ fn main() {
                     if let Some(tray) = &mut tray {
                         refresh_tray_menu(tray, &state);
                     } else {
-                        ensure_tray_visible(&mut tray, &state);
+                        ensure_tray_visible(&mut tray, &state, &tray_proxy);
                     }
                     save_window_position(&window, &mut state.settings);
                     save_settings(&state.settings);
@@ -450,7 +485,8 @@ impl Renderer {
         let surface = unsafe {
             instance
                 .create_surface_unsafe(
-                    wgpu::SurfaceTargetUnsafe::from_window(window).map_err(|error| error.to_string())?,
+                    wgpu::SurfaceTargetUnsafe::from_window(window)
+                        .map_err(|error| error.to_string())?,
                 )
                 .map_err(|error| error.to_string())?
         };
@@ -575,10 +611,22 @@ impl Renderer {
             multiview: None,
         });
         let vertices = [
-            Vertex { position: [-1.0, -1.0], tex_coord: [0.0, 1.0] },
-            Vertex { position: [1.0, -1.0], tex_coord: [1.0, 1.0] },
-            Vertex { position: [1.0, 1.0], tex_coord: [1.0, 0.0] },
-            Vertex { position: [-1.0, 1.0], tex_coord: [0.0, 0.0] },
+            Vertex {
+                position: [-1.0, -1.0],
+                tex_coord: [0.0, 1.0],
+            },
+            Vertex {
+                position: [1.0, -1.0],
+                tex_coord: [1.0, 1.0],
+            },
+            Vertex {
+                position: [1.0, 1.0],
+                tex_coord: [1.0, 0.0],
+            },
+            Vertex {
+                position: [-1.0, 1.0],
+                tex_coord: [0.0, 0.0],
+            },
         ];
         let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -712,10 +760,14 @@ impl Renderer {
                 }
             }
         };
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("native-pet-render-encoder"),
-        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("native-pet-render-encoder"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("native-pet-render-pass"),
@@ -808,14 +860,14 @@ fn configure_transparent_window(window: &Window) {
     }
 }
 
-fn create_tray(state: &AppState) -> Result<TrayIcon, String> {
+#[cfg(target_os = "windows")]
+fn create_tray(state: &AppState, proxy: EventLoopProxy<String>) -> Result<AppTray, String> {
+    WindowsTray::new(proxy, build_windows_tray_entries(state))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn create_tray(state: &AppState, _proxy: EventLoopProxy<String>) -> Result<AppTray, String> {
     let menu = build_tray_menu(state)?;
-    #[cfg(target_os = "windows")]
-    let icon = Icon::from_rgba(tray_icon_rgba(32), 32, 32)
-        .ok()
-        .or_else(|| load_tray_icon(&state.root))
-        .ok_or_else(|| "failed to create tray icon".to_string())?;
-    #[cfg(not(target_os = "windows"))]
     let icon = load_tray_icon(&state.root)
         .or_else(|| Icon::from_rgba(tray_icon_rgba(32), 32, 32).ok())
         .ok_or_else(|| "failed to create tray icon".to_string())?;
@@ -831,9 +883,13 @@ fn create_tray(state: &AppState) -> Result<TrayIcon, String> {
         .map_err(|error| error.to_string())
 }
 
-fn ensure_tray_visible(tray: &mut Option<TrayIcon>, state: &AppState) {
+fn ensure_tray_visible(
+    tray: &mut Option<AppTray>,
+    state: &AppState,
+    proxy: &EventLoopProxy<String>,
+) {
     if tray.is_none() {
-        match create_tray(state) {
+        match create_tray(state, proxy.clone()) {
             Ok(new_tray) => {
                 eprintln!("native-pet: tray icon created");
                 *tray = Some(new_tray);
@@ -849,22 +905,15 @@ fn ensure_tray_visible(tray: &mut Option<TrayIcon>, state: &AppState) {
     {
         let mut should_recreate = false;
         if let Some(current_tray) = tray.as_ref() {
-            if current_tray.rect().is_none() {
-                eprintln!("native-pet: tray icon rect unavailable; asking Windows shell to show it again");
+            if !current_tray.is_registered() {
+                eprintln!(
+                    "native-pet: Windows tray is not registered; asking shell to show it again"
+                );
                 if let Err(error) = current_tray.set_visible(true) {
                     eprintln!("native-pet: failed to show tray icon: {error}");
                     should_recreate = true;
                 }
-                if let Err(error) = current_tray.set_tooltip(Some(APP_NAME)) {
-                    eprintln!("native-pet: failed to refresh tray tooltip: {error}");
-                }
-                if let Ok(icon) = Icon::from_rgba(tray_icon_rgba(32), 32, 32) {
-                    if let Err(error) = current_tray.set_icon(Some(icon)) {
-                        eprintln!("native-pet: failed to refresh tray icon: {error}");
-                        should_recreate = true;
-                    }
-                }
-                if current_tray.rect().is_none() {
+                if !current_tray.is_registered() {
                     should_recreate = true;
                 }
             }
@@ -872,7 +921,7 @@ fn ensure_tray_visible(tray: &mut Option<TrayIcon>, state: &AppState) {
         if should_recreate {
             eprintln!("native-pet: recreating Windows tray icon");
             *tray = None;
-            match create_tray(state) {
+            match create_tray(state, proxy.clone()) {
                 Ok(new_tray) => *tray = Some(new_tray),
                 Err(error) => eprintln!("native-pet: failed to recreate tray icon: {error}"),
             }
@@ -906,7 +955,11 @@ fn build_tray_menu(state: &AppState) -> Result<Menu, String> {
         .append_items(&[&random_once, &next_action, &action_separator])
         .map_err(|error| error.to_string())?;
 
-    let by_id: HashMap<&str, &Action> = state.actions.iter().map(|action| (action.id.as_str(), action)).collect();
+    let by_id: HashMap<&str, &Action> = state
+        .actions
+        .iter()
+        .map(|action| (action.id.as_str(), action))
+        .collect();
     for (group_label, ids) in ACTION_GROUPS {
         let group = Submenu::new(*group_label, true);
         for id in *ids {
@@ -936,7 +989,8 @@ fn build_tray_menu(state: &AppState) -> Result<Menu, String> {
     appearance
         .append_items(&[&size, &speed])
         .map_err(|error| error.to_string())?;
-    menu.append(&appearance).map_err(|error| error.to_string())?;
+    menu.append(&appearance)
+        .map_err(|error| error.to_string())?;
 
     let monitor = Submenu::new("监视", true);
     let random = MenuItem::with_id(
@@ -1001,7 +1055,12 @@ fn build_tray_menu(state: &AppState) -> Result<Menu, String> {
     Ok(menu)
 }
 
-fn refresh_tray_menu(tray: &mut TrayIcon, state: &AppState) {
+fn refresh_tray_menu(tray: &mut AppTray, state: &AppState) {
+    #[cfg(target_os = "windows")]
+    {
+        tray.set_entries(build_windows_tray_entries(state));
+    }
+    #[cfg(not(target_os = "windows"))]
     match build_tray_menu(state) {
         Ok(menu) => tray.set_menu(Some(Box::new(menu))),
         Err(error) => eprintln!("failed to refresh tray menu: {error}"),
@@ -1052,8 +1111,12 @@ fn handle_command(state: &mut AppState, window: &Window, command: &str) -> bool 
             state.settings.random_enabled = !state.settings.random_enabled;
             state.next_random_at = Instant::now() + random_delay();
         }
-        "toggle-mouse-watch" => state.settings.mouse_watch_enabled = !state.settings.mouse_watch_enabled,
-        "toggle-input-watch" => state.settings.input_watch_enabled = !state.settings.input_watch_enabled,
+        "toggle-mouse-watch" => {
+            state.settings.mouse_watch_enabled = !state.settings.mouse_watch_enabled
+        }
+        "toggle-input-watch" => {
+            state.settings.input_watch_enabled = !state.settings.input_watch_enabled
+        }
         "toggle-autostart" => {
             if let Err(error) = set_autostart(!autostart_enabled()) {
                 eprintln!("failed to toggle autostart: {error}");
@@ -1117,53 +1180,54 @@ fn start_input_monitor(proxy: tao::event_loop::EventLoopProxy<String>) {
 
 #[cfg(target_os = "macos")]
 fn start_macos_input_monitor(proxy: tao::event_loop::EventLoopProxy<String>) {
-    std::thread::spawn(move || {
-        unsafe {
-            let mask = cg_event_mask(&[
-                K_CG_EVENT_LEFT_MOUSE_DOWN,
-                K_CG_EVENT_LEFT_MOUSE_UP,
-                K_CG_EVENT_RIGHT_MOUSE_DOWN,
-                K_CG_EVENT_RIGHT_MOUSE_UP,
-                K_CG_EVENT_MOUSE_MOVED,
-                K_CG_EVENT_LEFT_MOUSE_DRAGGED,
-                K_CG_EVENT_RIGHT_MOUSE_DRAGGED,
-                K_CG_EVENT_KEY_DOWN,
-                K_CG_EVENT_SCROLL_WHEEL,
-                K_CG_EVENT_OTHER_MOUSE_DOWN,
-                K_CG_EVENT_OTHER_MOUSE_UP,
-                K_CG_EVENT_OTHER_MOUSE_DRAGGED,
-            ]);
-            let context = Box::new(MonitorContext { proxy, tap: std::ptr::null_mut() });
-            let user_info = Box::into_raw(context) as *mut c_void;
-            let tap = CGEventTapCreate(
-                K_CG_HID_EVENT_TAP,
-                K_CG_HEAD_INSERT_EVENT_TAP,
-                K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
-                mask,
-                macos_event_tap_callback,
-                user_info,
-            );
-            if tap.is_null() {
-                drop(Box::from_raw(user_info as *mut MonitorContext));
-                eprintln!("global input monitor unavailable; grant Accessibility permission");
-                return;
-            }
-            (*(user_info as *mut MonitorContext)).tap = tap;
-            let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
-            if source.is_null() {
-                CFRelease(tap);
-                drop(Box::from_raw(user_info as *mut MonitorContext));
-                eprintln!("global input monitor failed to create runloop source");
-                return;
-            }
-            let run_loop = CFRunLoopGetCurrent();
-            CFRunLoopAddSource(run_loop, source, K_CF_RUN_LOOP_COMMON_MODES);
-            CGEventTapEnable(tap, true);
-            CFRunLoopRun();
-            CFRelease(source);
+    std::thread::spawn(move || unsafe {
+        let mask = cg_event_mask(&[
+            K_CG_EVENT_LEFT_MOUSE_DOWN,
+            K_CG_EVENT_LEFT_MOUSE_UP,
+            K_CG_EVENT_RIGHT_MOUSE_DOWN,
+            K_CG_EVENT_RIGHT_MOUSE_UP,
+            K_CG_EVENT_MOUSE_MOVED,
+            K_CG_EVENT_LEFT_MOUSE_DRAGGED,
+            K_CG_EVENT_RIGHT_MOUSE_DRAGGED,
+            K_CG_EVENT_KEY_DOWN,
+            K_CG_EVENT_SCROLL_WHEEL,
+            K_CG_EVENT_OTHER_MOUSE_DOWN,
+            K_CG_EVENT_OTHER_MOUSE_UP,
+            K_CG_EVENT_OTHER_MOUSE_DRAGGED,
+        ]);
+        let context = Box::new(MonitorContext {
+            proxy,
+            tap: std::ptr::null_mut(),
+        });
+        let user_info = Box::into_raw(context) as *mut c_void;
+        let tap = CGEventTapCreate(
+            K_CG_HID_EVENT_TAP,
+            K_CG_HEAD_INSERT_EVENT_TAP,
+            K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+            mask,
+            macos_event_tap_callback,
+            user_info,
+        );
+        if tap.is_null() {
+            drop(Box::from_raw(user_info as *mut MonitorContext));
+            eprintln!("global input monitor unavailable; grant Accessibility permission");
+            return;
+        }
+        (*(user_info as *mut MonitorContext)).tap = tap;
+        let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+        if source.is_null() {
             CFRelease(tap);
             drop(Box::from_raw(user_info as *mut MonitorContext));
+            eprintln!("global input monitor failed to create runloop source");
+            return;
         }
+        let run_loop = CFRunLoopGetCurrent();
+        CFRunLoopAddSource(run_loop, source, K_CF_RUN_LOOP_COMMON_MODES);
+        CGEventTapEnable(tap, true);
+        CFRunLoopRun();
+        CFRelease(source);
+        CFRelease(tap);
+        drop(Box::from_raw(user_info as *mut MonitorContext));
     });
 }
 
@@ -1248,7 +1312,12 @@ extern "C" {
         place: u32,
         options: u32,
         events_of_interest: u64,
-        callback: extern "C" fn(CGEventTapProxy, CGEventType, CGEventRef, *mut c_void) -> CGEventRef,
+        callback: extern "C" fn(
+            CGEventTapProxy,
+            CGEventType,
+            CGEventRef,
+            *mut c_void,
+        ) -> CGEventRef,
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
@@ -1278,7 +1347,9 @@ extern "C" {
 
 #[cfg(target_os = "macos")]
 fn cg_event_mask(types: &[CGEventType]) -> u64 {
-    types.iter().fold(0_u64, |mask, event_type| mask | (1_u64 << *event_type))
+    types
+        .iter()
+        .fold(0_u64, |mask, event_type| mask | (1_u64 << *event_type))
 }
 
 #[cfg(target_os = "macos")]
@@ -1302,17 +1373,28 @@ extern "C" fn macos_event_tap_callback(
             return event;
         };
         match event_type {
-            K_CG_EVENT_MOUSE_MOVED | K_CG_EVENT_LEFT_MOUSE_DRAGGED | K_CG_EVENT_RIGHT_MOUSE_DRAGGED | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
+            K_CG_EVENT_MOUSE_MOVED
+            | K_CG_EVENT_LEFT_MOUSE_DRAGGED
+            | K_CG_EVENT_RIGHT_MOUSE_DRAGGED
+            | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
                 let point = CGEventGetLocation(event);
-                let _ = context.proxy.send_event(format!("native-mousemove::{},{}", point.x, point.y));
+                let _ = context
+                    .proxy
+                    .send_event(format!("native-mousemove::{},{}", point.x, point.y));
             }
-            K_CG_EVENT_LEFT_MOUSE_DOWN | K_CG_EVENT_RIGHT_MOUSE_DOWN | K_CG_EVENT_OTHER_MOUSE_DOWN => {
+            K_CG_EVENT_LEFT_MOUSE_DOWN
+            | K_CG_EVENT_RIGHT_MOUSE_DOWN
+            | K_CG_EVENT_OTHER_MOUSE_DOWN => {
                 let point = CGEventGetLocation(event);
-                let _ = context.proxy.send_event(format!("native-mousedown::{},{}", point.x, point.y));
+                let _ = context
+                    .proxy
+                    .send_event(format!("native-mousedown::{},{}", point.x, point.y));
             }
             K_CG_EVENT_LEFT_MOUSE_UP | K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP => {
                 let point = CGEventGetLocation(event);
-                let _ = context.proxy.send_event(format!("native-mouseup::{},{}", point.x, point.y));
+                let _ = context
+                    .proxy
+                    .send_event(format!("native-mouseup::{},{}", point.x, point.y));
             }
             K_CG_EVENT_KEY_DOWN => {
                 let _ = context.proxy.send_event("native-keydown".to_string());
@@ -1334,7 +1416,12 @@ fn parse_point(payload: &str) -> Option<(f64, f64)> {
 fn window_rect(window: &Window) -> Option<(f64, f64, f64, f64)> {
     let position = window.outer_position().ok()?;
     let size = window.inner_size();
-    Some((position.x as f64, position.y as f64, size.width as f64, size.height as f64))
+    Some((
+        position.x as f64,
+        position.y as f64,
+        size.width as f64,
+        size.height as f64,
+    ))
 }
 
 fn point_inside_window(window: &Window, x: f64, y: f64) -> bool {
@@ -1512,7 +1599,8 @@ fn finish_drag(state: &mut AppState, window: &Window) {
     };
     if drag.dragging {
         state.pending_return = None;
-        if let Some(stop_action) = movement_stop_action(drag.last_direction_right, drag.last_speed) {
+        if let Some(stop_action) = movement_stop_action(drag.last_direction_right, drag.last_speed)
+        {
             state.set_action_once(stop_action, "idle", MOVEMENT_STOP_DURATION);
         } else {
             state.set_action("idle");
@@ -1578,9 +1666,11 @@ fn update_drag_motion(state: &mut AppState, window: &Window, x: f64, y: f64) -> 
                 };
                 drag.direction_accumulator_x =
                     (drag.direction_accumulator_x * 0.78 + step_delta_x).clamp(-48.0, 48.0);
-                if let Some(direction_right) =
-                    movement_direction(drag.smoothed_velocity_x, drag.direction_accumulator_x, drag.last_direction_right)
-                {
+                if let Some(direction_right) = movement_direction(
+                    drag.smoothed_velocity_x,
+                    drag.direction_accumulator_x,
+                    drag.last_direction_right,
+                ) {
                     if direction_right != drag.last_direction_right {
                         drag.last_direction_right = direction_right;
                         drag.direction_accumulator_x = 0.0;
@@ -1595,7 +1685,10 @@ fn update_drag_motion(state: &mut AppState, window: &Window, x: f64, y: f64) -> 
                     &mut drag.walk_candidate_since,
                     now,
                 );
-                drag_action = Some(movement_action(drag.last_direction_right, drag.last_running));
+                drag_action = Some(movement_action(
+                    drag.last_direction_right,
+                    drag.last_running,
+                ));
             }
         }
         drag.last_cursor_x = x;
@@ -1639,13 +1732,19 @@ fn handle_mouse_reactivity(state: &mut AppState, window: &Window, x: f64, y: f64
     state.mouse_near = near;
     state.mouse_inside = inside;
 
-    if near && !was_near && now.duration_since(state.last_mouse_near_at) > Duration::from_millis(2800) {
+    if near
+        && !was_near
+        && now.duration_since(state.last_mouse_near_at) > Duration::from_millis(2800)
+    {
         state.last_mouse_near_at = now;
         state.set_action_once("mouse-hover", "idle", Duration::from_millis(1300));
         return;
     }
 
-    if hovering && !was_inside && now.duration_since(state.last_mouse_hover_at) > Duration::from_millis(3200) {
+    if hovering
+        && !was_inside
+        && now.duration_since(state.last_mouse_hover_at) > Duration::from_millis(3200)
+    {
         state.last_mouse_hover_at = now;
         state.set_action_once("mouse-hover", "idle", Duration::from_millis(1300));
         return;
@@ -1697,7 +1796,11 @@ fn movement_direction(velocity_x: f64, accumulated_x: f64, current_right: bool) 
 
 fn movement_action(direction_right: bool, running: bool) -> &'static str {
     if running {
-        if direction_right { "running-right" } else { "running-left" }
+        if direction_right {
+            "running-right"
+        } else {
+            "running-left"
+        }
     } else if direction_right {
         "walk-right-stop"
     } else {
@@ -1711,7 +1814,11 @@ fn movement_stop_action(direction_right: bool, speed_px_per_second: f64) -> Opti
         return None;
     }
     Some(if speed_px_per_second >= RUN_EXIT_SPEED {
-        if direction_right { "running-right-stop" } else { "running-left-stop" }
+        if direction_right {
+            "running-right-stop"
+        } else {
+            "running-left-stop"
+        }
     } else if direction_right {
         "walk-right-stop"
     } else {
@@ -1743,7 +1850,10 @@ fn set_size(state: &mut AppState, window: &Window, size: u32) {
 }
 
 fn reactive_state(action: &str) -> bool {
-    matches!(action, "waiting" | "review" | "waving" | "typing" | "mouse-hover" | "drag-held")
+    matches!(
+        action,
+        "waiting" | "review" | "waving" | "typing" | "mouse-hover" | "drag-held"
+    )
 }
 
 fn normalize_settings(mut settings: Settings) -> Settings {
@@ -1906,7 +2016,9 @@ fn user_domain() -> String {
 
 #[cfg(target_os = "macos")]
 fn run_launchctl(args: &[&str]) {
-    let _ = std::process::Command::new("/bin/launchctl").args(args).output();
+    let _ = std::process::Command::new("/bin/launchctl")
+        .args(args)
+        .output();
 }
 
 #[cfg(target_os = "macos")]
@@ -2030,7 +2142,10 @@ fn load_action_frames(path: &Path) -> Vec<FrameImage> {
             frames
                 .flatten()
                 .map(|frame| frame.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("png")))
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -2106,7 +2221,8 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
                 && yf <= center * 1.04
                 && xf >= center * 0.82
                 && xf <= center * 1.18;
-            let outline = dx * dx / (center * 0.67).powi(2) + dy * dy / (center * 0.63).powi(2) <= 1.0
+            let outline = dx * dx / (center * 0.67).powi(2) + dy * dy / (center * 0.63).powi(2)
+                <= 1.0
                 && !head;
 
             let color = if eye || smile {
@@ -2127,6 +2243,446 @@ fn tray_icon_rgba(size: u32) -> Vec<u8> {
         }
     }
     rgba
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Debug)]
+enum TrayMenuEntry {
+    Command {
+        label: String,
+        command: String,
+        enabled: bool,
+    },
+    Separator,
+    Submenu {
+        label: String,
+        children: Vec<TrayMenuEntry>,
+    },
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_tray_entries(state: &AppState) -> Vec<TrayMenuEntry> {
+    let mut entries = Vec::new();
+    entries.push(TrayMenuEntry::Command {
+        label: "显示桌宠".to_string(),
+        command: "show".to_string(),
+        enabled: true,
+    });
+    entries.push(TrayMenuEntry::Command {
+        label: "隐藏桌宠".to_string(),
+        command: "hide".to_string(),
+        enabled: true,
+    });
+    entries.push(TrayMenuEntry::Separator);
+
+    let by_id: HashMap<&str, &Action> = state
+        .actions
+        .iter()
+        .map(|action| (action.id.as_str(), action))
+        .collect();
+    let mut action_children = vec![
+        TrayMenuEntry::Command {
+            label: "马上随机一次".to_string(),
+            command: "random-once".to_string(),
+            enabled: true,
+        },
+        TrayMenuEntry::Command {
+            label: "下一个动作".to_string(),
+            command: "next-action".to_string(),
+            enabled: true,
+        },
+        TrayMenuEntry::Separator,
+    ];
+    for (group_label, ids) in ACTION_GROUPS {
+        let mut group_children = Vec::new();
+        for id in *ids {
+            if let Some(action) = by_id.get(id) {
+                group_children.push(TrayMenuEntry::Command {
+                    label: action.label.clone(),
+                    command: format!("action::{id}"),
+                    enabled: true,
+                });
+            }
+        }
+        if !group_children.is_empty() {
+            action_children.push(TrayMenuEntry::Submenu {
+                label: (*group_label).to_string(),
+                children: group_children,
+            });
+        }
+    }
+    entries.push(TrayMenuEntry::Submenu {
+        label: "动作".to_string(),
+        children: action_children,
+    });
+
+    entries.push(TrayMenuEntry::Submenu {
+        label: "外观".to_string(),
+        children: vec![
+            TrayMenuEntry::Submenu {
+                label: format!("大小：{}px", state.settings.size),
+                children: vec![
+                    TrayMenuEntry::Command {
+                        label: "放大".to_string(),
+                        command: "size-plus".to_string(),
+                        enabled: true,
+                    },
+                    TrayMenuEntry::Command {
+                        label: "缩小".to_string(),
+                        command: "size-minus".to_string(),
+                        enabled: true,
+                    },
+                    TrayMenuEntry::Command {
+                        label: "恢复默认大小".to_string(),
+                        command: "size-reset".to_string(),
+                        enabled: true,
+                    },
+                ],
+            },
+            TrayMenuEntry::Submenu {
+                label: format!("速度：{:.2}x", state.settings.speed),
+                children: vec![
+                    TrayMenuEntry::Command {
+                        label: "加快".to_string(),
+                        command: "speed-plus".to_string(),
+                        enabled: true,
+                    },
+                    TrayMenuEntry::Command {
+                        label: "减慢".to_string(),
+                        command: "speed-minus".to_string(),
+                        enabled: true,
+                    },
+                    TrayMenuEntry::Command {
+                        label: "恢复默认速度".to_string(),
+                        command: "speed-reset".to_string(),
+                        enabled: true,
+                    },
+                ],
+            },
+        ],
+    });
+
+    entries.push(TrayMenuEntry::Submenu {
+        label: "监视".to_string(),
+        children: vec![
+            TrayMenuEntry::Command {
+                label: if state.settings.random_enabled {
+                    "随机动作：开"
+                } else {
+                    "随机动作：关"
+                }
+                .to_string(),
+                command: "toggle-random".to_string(),
+                enabled: true,
+            },
+            TrayMenuEntry::Command {
+                label: if state.settings.mouse_watch_enabled {
+                    "鼠标位置监视：开"
+                } else {
+                    "鼠标位置监视：关"
+                }
+                .to_string(),
+                command: "toggle-mouse-watch".to_string(),
+                enabled: true,
+            },
+            TrayMenuEntry::Command {
+                label: if state.settings.input_watch_enabled {
+                    "键盘/滚轮监视：开"
+                } else {
+                    "键盘/滚轮监视：关"
+                }
+                .to_string(),
+                command: "toggle-input-watch".to_string(),
+                enabled: true,
+            },
+            TrayMenuEntry::Command {
+                label: if autostart_enabled() {
+                    "开机自启：开"
+                } else {
+                    "开机自启：关"
+                }
+                .to_string(),
+                command: "toggle-autostart".to_string(),
+                enabled: autostart_supported(),
+            },
+            TrayMenuEntry::Command {
+                label: if accessibility_granted() {
+                    "辅助功能权限：已允许"
+                } else {
+                    "打开辅助功能设置"
+                }
+                .to_string(),
+                command: "open-accessibility-settings".to_string(),
+                enabled: true,
+            },
+        ],
+    });
+
+    entries.push(TrayMenuEntry::Separator);
+    entries.push(TrayMenuEntry::Command {
+        label: "退出".to_string(),
+        command: "quit".to_string(),
+        enabled: true,
+    });
+    entries
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsTray {
+    hwnd: HWND,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsTrayData {
+    proxy: EventLoopProxy<String>,
+    entries: Vec<TrayMenuEntry>,
+    commands: Vec<(u16, String)>,
+    registered: bool,
+}
+
+#[cfg(target_os = "windows")]
+const WM_NATIVE_TRAY: u32 = WM_APP + 77;
+
+#[cfg(target_os = "windows")]
+impl WindowsTray {
+    fn new(proxy: EventLoopProxy<String>, entries: Vec<TrayMenuEntry>) -> Result<Self, String> {
+        unsafe {
+            let class_name = wide_null("q_jk_desktop_pet_native_tray");
+            let instance = GetModuleHandleW(std::ptr::null());
+            let window_class = WNDCLASSW {
+                lpfnWndProc: Some(windows_tray_proc),
+                hInstance: instance,
+                lpszClassName: class_name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            RegisterClassW(&window_class);
+
+            let data = Box::new(WindowsTrayData {
+                proxy,
+                entries,
+                commands: Vec::new(),
+                registered: false,
+            });
+            let raw_data = Box::into_raw(data);
+            let hwnd = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                class_name.as_ptr(),
+                std::ptr::null(),
+                WS_OVERLAPPED,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                raw_data.cast(),
+            );
+            if hwnd.is_null() {
+                drop(Box::from_raw(raw_data));
+                return Err(format!("CreateWindowExW failed: {}", GetLastError()));
+            }
+
+            let tray = Self { hwnd };
+            tray.register()?;
+            Ok(tray)
+        }
+    }
+
+    fn set_entries(&self, entries: Vec<TrayMenuEntry>) {
+        unsafe {
+            if let Some(data) = self.data_mut() {
+                data.entries = entries;
+            }
+        }
+    }
+
+    fn is_registered(&self) -> bool {
+        unsafe { self.data_mut().map(|data| data.registered).unwrap_or(false) }
+    }
+
+    fn set_visible(&self, visible: bool) -> Result<(), String> {
+        if visible {
+            self.register()
+        } else {
+            self.unregister();
+            Ok(())
+        }
+    }
+
+    fn register(&self) -> Result<(), String> {
+        unsafe {
+            let icon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+            let mut tip = [0_u16; 128];
+            let tip_wide = wide_null(APP_NAME);
+            for (index, value) in tip_wide.iter().take(127).enumerate() {
+                tip[index] = *value;
+            }
+            let mut data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: self.hwnd,
+                uID: 1,
+                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+                uCallbackMessage: WM_NATIVE_TRAY,
+                hIcon: icon,
+                szTip: tip,
+                ..std::mem::zeroed()
+            };
+            if Shell_NotifyIconW(NIM_ADD, &mut data) == 0 {
+                let error = GetLastError();
+                if let Some(tray_data) = self.data_mut() {
+                    tray_data.registered = false;
+                }
+                return Err(format!("Shell_NotifyIconW(NIM_ADD) failed: {error}"));
+            }
+            if let Some(tray_data) = self.data_mut() {
+                tray_data.registered = true;
+            }
+            Ok(())
+        }
+    }
+
+    fn unregister(&self) {
+        unsafe {
+            let mut data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: self.hwnd,
+                uID: 1,
+                ..std::mem::zeroed()
+            };
+            Shell_NotifyIconW(NIM_DELETE, &mut data);
+            if let Some(tray_data) = self.data_mut() {
+                tray_data.registered = false;
+            }
+        }
+    }
+
+    unsafe fn data_mut(&self) -> Option<&mut WindowsTrayData> {
+        let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut WindowsTrayData;
+        ptr.as_mut()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsTray {
+    fn drop(&mut self) {
+        unsafe {
+            self.unregister();
+            let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut WindowsTrayData;
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+            if !ptr.is_null() {
+                drop(Box::from_raw(ptr));
+            }
+            DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn windows_tray_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match message {
+        WM_NCCREATE => {
+            let create = lparam as *const CREATESTRUCTW;
+            if !create.is_null() {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, (*create).lpCreateParams as isize);
+            }
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        WM_NATIVE_TRAY => {
+            let event = lparam as u32;
+            if event == WM_RBUTTONUP || event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
+                show_windows_tray_menu(hwnd);
+                return 0;
+            }
+            0
+        }
+        WM_DESTROY => 0,
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn show_windows_tray_menu(hwnd: HWND) {
+    let Some(data) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowsTrayData).as_mut()
+    else {
+        return;
+    };
+    data.commands.clear();
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return;
+    }
+    let mut next_id = 1000_u16;
+    append_windows_menu_entries(menu, &data.entries, &mut data.commands, &mut next_id);
+
+    let mut cursor = POINT { x: 0, y: 0 };
+    if GetCursorPos(&mut cursor) == 0 {
+        DestroyMenu(menu);
+        return;
+    }
+    SetForegroundWindow(hwnd);
+    let selected = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        cursor.x,
+        cursor.y,
+        0,
+        hwnd,
+        std::ptr::null(),
+    );
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    if selected != 0 {
+        if let Some((_, command)) = data.commands.iter().find(|(id, _)| *id == selected as u16) {
+            let _ = data.proxy.send_event(command.clone());
+        }
+    }
+    DestroyMenu(menu);
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn append_windows_menu_entries(
+    menu: HMENU,
+    entries: &[TrayMenuEntry],
+    commands: &mut Vec<(u16, String)>,
+    next_id: &mut u16,
+) {
+    for entry in entries {
+        match entry {
+            TrayMenuEntry::Separator => {
+                AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            }
+            TrayMenuEntry::Command {
+                label,
+                command,
+                enabled,
+            } => {
+                let id = *next_id;
+                *next_id = next_id.saturating_add(1);
+                commands.push((id, command.clone()));
+                let label = wide_null(label);
+                let enabled_flag = if *enabled { MF_ENABLED } else { MF_GRAYED };
+                AppendMenuW(menu, MF_STRING | enabled_flag, id as usize, label.as_ptr());
+            }
+            TrayMenuEntry::Submenu { label, children } => {
+                let submenu = CreatePopupMenu();
+                if !submenu.is_null() {
+                    append_windows_menu_entries(submenu, children, commands, next_id);
+                    let label = wide_null(label);
+                    AppendMenuW(menu, MF_POPUP | MF_STRING, submenu as usize, label.as_ptr());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[allow(dead_code)]

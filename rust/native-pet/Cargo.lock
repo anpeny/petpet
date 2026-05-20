@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "native-pet"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytemuck",
  "image",
@@ -1391,6 +1391,7 @@ dependencies = [
  "tao",
  "tray-icon",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
