@@ -323,7 +323,8 @@ fn main() {
     let window = create_pet_window(&event_loop, state.settings.size);
     apply_saved_position(&window, &state.settings);
     let mut renderer = pollster::block_on(Renderer::new(&window)).expect("failed to create renderer");
-    let mut tray = create_tray(&state).expect("failed to create native tray");
+    let mut tray: Option<TrayIcon> = None;
+    let mut last_tray_check = Instant::now() - Duration::from_secs(10);
 
     MenuEvent::set_event_handler(Some({
         let proxy = event_loop.create_proxy();
@@ -336,14 +337,25 @@ fn main() {
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
         match event {
+            Event::NewEvents(StartCause::Init) => {
+                ensure_tray_visible(&mut tray, &state);
+            }
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 state.tick();
+                if last_tray_check.elapsed() >= Duration::from_secs(5) {
+                    last_tray_check = Instant::now();
+                    ensure_tray_visible(&mut tray, &state);
+                }
                 window.request_redraw();
             }
             Event::UserEvent(command) => {
                 let should_rebuild_menu = handle_command(&mut state, &window, &command);
                 if should_rebuild_menu {
-                    refresh_tray_menu(&mut tray, &state);
+                    if let Some(tray) = &mut tray {
+                        refresh_tray_menu(tray, &state);
+                    } else {
+                        ensure_tray_visible(&mut tray, &state);
+                    }
                     save_window_position(&window, &mut state.settings);
                     save_settings(&state.settings);
                 }
@@ -808,6 +820,7 @@ fn create_tray(state: &AppState) -> Result<TrayIcon, String> {
         .or_else(|| Icon::from_rgba(tray_icon_rgba(32), 32, 32).ok())
         .ok_or_else(|| "failed to create tray icon".to_string())?;
     TrayIconBuilder::new()
+        .with_id("q-jk-desktop-pet")
         .with_tooltip(APP_NAME)
         .with_icon(icon)
         .with_icon_as_template(cfg!(target_os = "macos"))
@@ -816,6 +829,55 @@ fn create_tray(state: &AppState) -> Result<TrayIcon, String> {
         .with_menu_on_right_click(true)
         .build()
         .map_err(|error| error.to_string())
+}
+
+fn ensure_tray_visible(tray: &mut Option<TrayIcon>, state: &AppState) {
+    if tray.is_none() {
+        match create_tray(state) {
+            Ok(new_tray) => {
+                eprintln!("native-pet: tray icon created");
+                *tray = Some(new_tray);
+            }
+            Err(error) => {
+                eprintln!("native-pet: failed to create tray icon: {error}");
+                return;
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut should_recreate = false;
+        if let Some(current_tray) = tray.as_ref() {
+            if current_tray.rect().is_none() {
+                eprintln!("native-pet: tray icon rect unavailable; asking Windows shell to show it again");
+                if let Err(error) = current_tray.set_visible(true) {
+                    eprintln!("native-pet: failed to show tray icon: {error}");
+                    should_recreate = true;
+                }
+                if let Err(error) = current_tray.set_tooltip(Some(APP_NAME)) {
+                    eprintln!("native-pet: failed to refresh tray tooltip: {error}");
+                }
+                if let Ok(icon) = Icon::from_rgba(tray_icon_rgba(32), 32, 32) {
+                    if let Err(error) = current_tray.set_icon(Some(icon)) {
+                        eprintln!("native-pet: failed to refresh tray icon: {error}");
+                        should_recreate = true;
+                    }
+                }
+                if current_tray.rect().is_none() {
+                    should_recreate = true;
+                }
+            }
+        }
+        if should_recreate {
+            eprintln!("native-pet: recreating Windows tray icon");
+            *tray = None;
+            match create_tray(state) {
+                Ok(new_tray) => *tray = Some(new_tray),
+                Err(error) => eprintln!("native-pet: failed to recreate tray icon: {error}"),
+            }
+        }
+    }
 }
 
 fn load_tray_icon(root: &Path) -> Option<Icon> {
