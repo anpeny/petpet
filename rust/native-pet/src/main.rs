@@ -7,10 +7,16 @@ use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "windows")]
+use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::os::raw::c_double;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{ElementState, Event, MouseButton, StartCause, WindowEvent};
 use tao::event_loop::EventLoopProxy;
@@ -20,7 +26,10 @@ use tao::platform::macos::{WindowBuilderExtMacOS, WindowExtMacOS};
 #[cfg(target_os = "windows")]
 use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::MenuEvent;
+#[cfg(not(target_os = "windows"))]
+use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+#[cfg(not(target_os = "windows"))]
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use wgpu::util::DeviceExt;
 #[cfg(target_os = "windows")]
@@ -29,7 +38,8 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::{
         Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+            Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            NOTIFYICONDATAW,
         },
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -141,6 +151,7 @@ impl Default for Settings {
 }
 
 struct AppState {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     root: PathBuf,
     actions: Vec<Action>,
     frames: HashMap<String, Vec<FrameImage>>,
@@ -349,6 +360,7 @@ type AppTray = TrayIcon;
 
 fn main() {
     let root = resource_root();
+    diagnostic_log(&format!("process start resource_root={}", root.display()));
     let event_loop = EventLoopBuilder::<String>::with_user_event().build();
     let tray_proxy = event_loop.create_proxy();
     let mut state = AppState::new(root);
@@ -423,6 +435,29 @@ fn main() {
                 ..
             } => {
                 handle_local_mouse_up(&mut state, &window);
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        state: ElementState::Released,
+                        button: MouseButton::Right,
+                        ..
+                    },
+                ..
+            } => {
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(tray) = tray.as_ref() {
+                        diagnostic_log("pet window right click: showing Windows fallback menu");
+                        tray.show_menu();
+                    } else {
+                        diagnostic_log("pet window right click: tray missing, recreating first");
+                        ensure_tray_visible(&mut tray, &state, &tray_proxy);
+                        if let Some(tray) = tray.as_ref() {
+                            tray.show_menu();
+                        }
+                    }
+                }
             }
             Event::WindowEvent {
                 event: WindowEvent::Moved(_),
@@ -892,10 +927,12 @@ fn ensure_tray_visible(
         match create_tray(state, proxy.clone()) {
             Ok(new_tray) => {
                 eprintln!("native-pet: tray icon created");
+                diagnostic_log("tray icon created");
                 *tray = Some(new_tray);
             }
             Err(error) => {
                 eprintln!("native-pet: failed to create tray icon: {error}");
+                diagnostic_log(&format!("failed to create tray icon: {error}"));
                 return;
             }
         }
@@ -905,12 +942,19 @@ fn ensure_tray_visible(
     {
         let mut should_recreate = false;
         if let Some(current_tray) = tray.as_ref() {
-            if !current_tray.is_registered() {
+            if current_tray.is_registered() {
+                if let Err(error) = current_tray.refresh_shell_icon() {
+                    diagnostic_log(&format!("Windows tray refresh failed: {error}"));
+                    should_recreate = true;
+                }
+            } else {
                 eprintln!(
                     "native-pet: Windows tray is not registered; asking shell to show it again"
                 );
+                diagnostic_log("Windows tray is not registered; trying to add it again");
                 if let Err(error) = current_tray.set_visible(true) {
                     eprintln!("native-pet: failed to show tray icon: {error}");
+                    diagnostic_log(&format!("failed to show Windows tray icon: {error}"));
                     should_recreate = true;
                 }
                 if !current_tray.is_registered() {
@@ -920,15 +964,46 @@ fn ensure_tray_visible(
         }
         if should_recreate {
             eprintln!("native-pet: recreating Windows tray icon");
+            diagnostic_log("recreating Windows tray icon");
             *tray = None;
             match create_tray(state, proxy.clone()) {
                 Ok(new_tray) => *tray = Some(new_tray),
-                Err(error) => eprintln!("native-pet: failed to recreate tray icon: {error}"),
+                Err(error) => {
+                    eprintln!("native-pet: failed to recreate tray icon: {error}");
+                    diagnostic_log(&format!("failed to recreate Windows tray icon: {error}"));
+                }
             }
         }
     }
 }
 
+#[cfg(target_os = "windows")]
+fn diagnostic_path() -> PathBuf {
+    settings_path()
+        .parent()
+        .map(|parent| parent.join("diagnostics.log"))
+        .unwrap_or_else(|| PathBuf::from("diagnostics.log"))
+}
+
+#[cfg(target_os = "windows")]
+fn diagnostic_log(message: &str) {
+    let path = diagnostic_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{timestamp}] {message}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn diagnostic_log(_message: &str) {}
+
+#[cfg(not(target_os = "windows"))]
 fn load_tray_icon(root: &Path) -> Option<Icon> {
     let image = ImageReader::open(root.join("assets").join("icons").join("tray-32.png"))
         .ok()?
@@ -939,6 +1014,7 @@ fn load_tray_icon(root: &Path) -> Option<Icon> {
     Icon::from_rgba(image.into_raw(), width, height).ok()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn build_tray_menu(state: &AppState) -> Result<Menu, String> {
     let menu = Menu::new();
     let show = MenuItem::with_id("show", "显示桌宠", true, None);
@@ -2199,6 +2275,7 @@ fn action_labels() -> HashMap<&'static str, String> {
     ])
 }
 
+#[cfg(not(target_os = "windows"))]
 fn tray_icon_rgba(size: u32) -> Vec<u8> {
     let mut rgba = vec![0; (size * size * 4) as usize];
     let center = size as f32 / 2.0;
@@ -2447,6 +2524,7 @@ const WM_NATIVE_TRAY: u32 = WM_APP + 77;
 impl WindowsTray {
     fn new(proxy: EventLoopProxy<String>, entries: Vec<TrayMenuEntry>) -> Result<Self, String> {
         unsafe {
+            diagnostic_log("WindowsTray::new start");
             let class_name = wide_null("q_jk_desktop_pet_native_tray");
             let instance = GetModuleHandleW(std::ptr::null());
             let window_class = WNDCLASSW {
@@ -2455,7 +2533,11 @@ impl WindowsTray {
                 lpszClassName: class_name.as_ptr(),
                 ..std::mem::zeroed()
             };
-            RegisterClassW(&window_class);
+            let class_atom = RegisterClassW(&window_class);
+            diagnostic_log(&format!(
+                "RegisterClassW atom={class_atom} last_error={}",
+                GetLastError()
+            ));
 
             let data = Box::new(WindowsTrayData {
                 proxy,
@@ -2478,6 +2560,7 @@ impl WindowsTray {
                 instance,
                 raw_data.cast(),
             );
+            diagnostic_log(&format!("CreateWindowExW hwnd={hwnd:p} last_error={}", GetLastError()));
             if hwnd.is_null() {
                 drop(Box::from_raw(raw_data));
                 return Err(format!("CreateWindowExW failed: {}", GetLastError()));
@@ -2512,31 +2595,32 @@ impl WindowsTray {
 
     fn register(&self) -> Result<(), String> {
         unsafe {
-            let icon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
-            let mut tip = [0_u16; 128];
-            let tip_wide = wide_null(APP_NAME);
-            for (index, value) in tip_wide.iter().take(127).enumerate() {
-                tip[index] = *value;
-            }
-            let mut data = NOTIFYICONDATAW {
-                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
-                hWnd: self.hwnd,
-                uID: 1,
-                uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
-                uCallbackMessage: WM_NATIVE_TRAY,
-                hIcon: icon,
-                szTip: tip,
-                ..std::mem::zeroed()
-            };
+            let mut data = self.notify_data();
             if Shell_NotifyIconW(NIM_ADD, &mut data) == 0 {
                 let error = GetLastError();
                 if let Some(tray_data) = self.data_mut() {
                     tray_data.registered = false;
                 }
+                diagnostic_log(&format!("Shell_NotifyIconW(NIM_ADD) failed error={error}"));
                 return Err(format!("Shell_NotifyIconW(NIM_ADD) failed: {error}"));
             }
+            diagnostic_log("Shell_NotifyIconW(NIM_ADD) succeeded");
             if let Some(tray_data) = self.data_mut() {
                 tray_data.registered = true;
+            }
+            Ok(())
+        }
+    }
+
+    fn refresh_shell_icon(&self) -> Result<(), String> {
+        unsafe {
+            let mut data = self.notify_data();
+            if Shell_NotifyIconW(NIM_MODIFY, &mut data) == 0 {
+                let error = GetLastError();
+                if let Some(tray_data) = self.data_mut() {
+                    tray_data.registered = false;
+                }
+                return Err(format!("Shell_NotifyIconW(NIM_MODIFY) failed: {error}"));
             }
             Ok(())
         }
@@ -2550,16 +2634,46 @@ impl WindowsTray {
                 uID: 1,
                 ..std::mem::zeroed()
             };
-            Shell_NotifyIconW(NIM_DELETE, &mut data);
+            let result = Shell_NotifyIconW(NIM_DELETE, &mut data);
+            diagnostic_log(&format!(
+                "Shell_NotifyIconW(NIM_DELETE) result={result} last_error={}",
+                GetLastError()
+            ));
             if let Some(tray_data) = self.data_mut() {
                 tray_data.registered = false;
             }
         }
     }
 
+    unsafe fn notify_data(&self) -> NOTIFYICONDATAW {
+        let icon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        diagnostic_log(&format!("LoadIconW hicon={icon:p} last_error={}", GetLastError()));
+        let mut tip = [0_u16; 128];
+        let tip_wide = wide_null(APP_NAME);
+        for (index, value) in tip_wide.iter().take(127).enumerate() {
+            tip[index] = *value;
+        }
+        NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: 1,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: WM_NATIVE_TRAY,
+            hIcon: icon,
+            szTip: tip,
+            ..std::mem::zeroed()
+        }
+    }
+
     unsafe fn data_mut(&self) -> Option<&mut WindowsTrayData> {
         let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut WindowsTrayData;
         ptr.as_mut()
+    }
+
+    fn show_menu(&self) {
+        unsafe {
+            show_windows_tray_menu(self.hwnd);
+        }
     }
 }
 
@@ -2595,6 +2709,7 @@ unsafe extern "system" fn windows_tray_proc(
         }
         WM_NATIVE_TRAY => {
             let event = lparam as u32;
+            diagnostic_log(&format!("WM_NATIVE_TRAY event={event}"));
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
                 show_windows_tray_menu(hwnd);
                 return 0;
@@ -2610,11 +2725,16 @@ unsafe extern "system" fn windows_tray_proc(
 unsafe fn show_windows_tray_menu(hwnd: HWND) {
     let Some(data) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowsTrayData).as_mut()
     else {
+        diagnostic_log("show_windows_tray_menu skipped: missing window data");
         return;
     };
     data.commands.clear();
     let menu = CreatePopupMenu();
     if menu.is_null() {
+        diagnostic_log(&format!(
+            "CreatePopupMenu failed last_error={}",
+            GetLastError()
+        ));
         return;
     }
     let mut next_id = 1000_u16;
@@ -2622,9 +2742,16 @@ unsafe fn show_windows_tray_menu(hwnd: HWND) {
 
     let mut cursor = POINT { x: 0, y: 0 };
     if GetCursorPos(&mut cursor) == 0 {
+        diagnostic_log(&format!("GetCursorPos failed last_error={}", GetLastError()));
         DestroyMenu(menu);
         return;
     }
+    diagnostic_log(&format!(
+        "show_windows_tray_menu at x={} y={} entries={}",
+        cursor.x,
+        cursor.y,
+        data.entries.len()
+    ));
     SetForegroundWindow(hwnd);
     let selected = TrackPopupMenu(
         menu,

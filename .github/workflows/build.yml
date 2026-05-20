@@ -6,6 +6,11 @@ on:
     branches:
       - main
       - master
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
 
 jobs:
   build-macos:
@@ -90,3 +95,31 @@ jobs:
           name: q-jk-desktop-pet-linux
           path: dist/linux/q-jk-desktop-pet-linux.tar.gz
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-macos
+      - build-windows
+      - build-linux
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/release
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find dist/release -type f -exec cp {} release-assets/ \;
+          ls -la release-assets
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Native desktop pet build for macOS, Windows, and Linux." \
+            --latest
