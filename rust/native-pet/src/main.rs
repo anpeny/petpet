@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use image::ImageReader;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -766,7 +768,9 @@ fn create_pet_window(event_loop: &tao::event_loop::EventLoop<String>, size: u32)
     let builder = builder.with_has_shadow(false);
 
     #[cfg(target_os = "windows")]
-    let builder = builder.with_undecorated_shadow(false);
+    let builder = builder
+        .with_undecorated_shadow(false)
+        .with_skip_taskbar(true);
 
     let window = builder
         .build(event_loop)
@@ -784,6 +788,7 @@ fn configure_transparent_window(window: &Window) {
     #[cfg(target_os = "windows")]
     {
         window.set_undecorated_shadow(false);
+        let _ = window.set_skip_taskbar(true);
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
